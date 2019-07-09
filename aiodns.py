@@ -127,18 +127,18 @@ class DnsResolver():
     async def resolve(self, hostname,qtype):
         if type(hostname) != bytes:
             hostname = hostname.encode('utf8')
+        response = DNSResponse()
+        response.hostname = hostname
         if not hostname:
             raise Exception('empty hostname!')
         if is_ip(hostname):
             # print('hostname is ip: {}'.format(hostname))
-            response = DNSResponse()
             response.answers.append((hostname.decode('utf8'),0,0))
             response.status = 'is_ip'
             return response
         if hostname in self._hosts:
             # print('hit hosts: {}'.format(hostname))
             ip = self._hosts[hostname]
-            response = DNSResponse()
             response.answers.append((ip.decode('utf8'),0,0))
             response.status = 'hit_hosts'
             return response
@@ -147,17 +147,14 @@ class DnsResolver():
         if cache_result: 
             if now - cache_result[1] < self._ttl:
                 # print('hit cache: {}'.format(cache_result))
-                response = DNSResponse()
-                response.answers.append(cache_result[0])
+                response.answers = cache_result[0]
                 response.status = 'hit_cache'
                 return response
             else:
-                result = await self._send_req(hostname, qtype)
-                return result
+                return await self._send_req(hostname, qtype)
         else:
             # print('not in cache: {}'.format(hostname))
-            result =  await self._send_req(hostname, qtype)
-            return result
+            return await self._send_req(hostname, qtype)
     
     async def _send_req(self, hostname, qtype):
         if not is_valid_hostname(hostname):
@@ -389,8 +386,9 @@ def elapsed(stime):
 async def test0(hostname,qtype,loop):
     try:
         stime = time.time()
-        result = await dns_resolver.resolve(hostname,qtype)
-        print('{}: {}, {}, time elapsed: {}ms'.format(hostname, result.answers, result.status, elapsed(stime)))
+        response = await dns_resolver.resolve(hostname,qtype)
+        # print(response)
+        print('{}: {}, {}, time elapsed: {}ms'.format(hostname, response.answers, response.status, elapsed(stime)))
     except Exception as e:
         print(e)
 
@@ -399,8 +397,9 @@ async def test1(hostname,qtype,loop):
     try:
         await asyncio.sleep(1)
         stime = time.time()
-        result = await dns_resolver.resolve(hostname,qtype)
-        print('{}: {}, {}, time elapsed: {}ms'.format(hostname, result.answers, result.status, elapsed(stime)))
+        response = await dns_resolver.resolve(hostname,qtype)
+        # print(response)
+        print('{}: {}, {}, time elapsed: {}ms'.format(hostname, response.answers, response.status, elapsed(stime)))
     except Exception as e:
         print(e)
 
@@ -409,8 +408,9 @@ async def test2(hostname,qtype,loop):
     try:
         await asyncio.sleep(3)
         stime = time.time()
-        result = await dns_resolver.resolve(hostname,qtype)
-        print('{}: {}, {}, time elapsed: {}ms'.format(hostname, result.answers, result.status, elapsed(stime)))
+        response = await dns_resolver.resolve(hostname,qtype)
+        # print(response)
+        print('{}: {}, {}, time elapsed: {}ms'.format(hostname, response.answers, response.status, elapsed(stime)))
     except Exception as e:
         print(e)
     
