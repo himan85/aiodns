@@ -167,7 +167,10 @@ class DnsResolver():
         sock.setblocking(False)
         sock.connect(self._name_server)
         await self._loop.sock_sendall(sock, req)
-        rsp = await self._loop.sock_recv(sock,512)
+        try:
+            rsp = await asyncio.wait_for(self._loop.sock_recv(sock,512), 10)
+        except asyncio.TimeoutError:
+            raise Exception('wait for dns response timeout!')
         sock.close()
         re_time = round(time.time())
         response = parse_response(rsp,qtype)
@@ -376,6 +379,7 @@ class LruCache():
     def pop(self, key):
         if key in self._queue:
             self._queue.pop(key)
+
 
 def elapsed(stime):
     el = time.time() - stime
