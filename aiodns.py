@@ -167,6 +167,7 @@ class DnsResolver():
         try:
             rsp = await asyncio.wait_for(self._loop.sock_recv(sock,512), 10)
         except asyncio.TimeoutError:
+            sock.close()
             raise Exception('wait for dns response timeout!')
         sock.close()
         re_time = round(time.time())
