@@ -151,12 +151,12 @@ class DnsResolver():
                 response.status = 'hit_cache'
                 return response
             else:
-                return await self._send_req(hostname, qtype)
+                return await self._send_req(response, hostname, qtype)
         else:
             # print('not in cache: {}'.format(hostname))
-            return await self._send_req(hostname, qtype)
+            return await self._send_req(response, hostname, qtype)
     
-    async def _send_req(self, hostname, qtype):
+    async def _send_req(self, response, hostname, qtype):
         if not is_valid_hostname(hostname):
             raise Exception('invalid hostname:{}'.format(hostname))
         req = build_request(hostname, self._QTYPES[0])
@@ -165,13 +165,13 @@ class DnsResolver():
         sock.connect(self._name_server)
         await self._loop.sock_sendall(sock, req)
         try:
-            rsp = await asyncio.wait_for(self._loop.sock_recv(sock,512), 10)
+            rsp = await asyncio.wait_for(self._loop.sock_recv(sock,512), 5)
         except asyncio.TimeoutError:
-            sock.close()
+            self._close_sock(self._loop, sock)
             raise Exception('wait for dns response timeout!')
         sock.close()
         re_time = round(time.time())
-        response = parse_response(rsp,qtype)
+        response = parse_response(response, rsp, qtype)
         self._cache.put(hostname,(response.answers,re_time))
         return response
 
@@ -199,6 +199,14 @@ class DnsResolver():
                             self._hosts[hostname] = ip
         except IOError:
             self._hosts['localhost'] = '127.0.0.1'
+
+    def _close_sock(self, loop, sock):
+        try:
+            loop.remove_reader(sock.fileno())
+        except NotImplementedError:
+            pass
+        finally:
+            sock.close()
 
 
 def is_ip(ipaddr):
@@ -263,7 +271,7 @@ def parse_header(data):
     return None
 
 
-def parse_response(data,qtype):
+def parse_response(response, data, qtype):
     try:
         if len(data) >= 12:
             header = parse_header(data)
@@ -291,7 +299,6 @@ def parse_response(data,qtype):
             for i in range(0, res_arcount):
                 l, r = parse_record(data, offset)
                 offset += l
-            response = DNSResponse()
             if qds:
                 response.hostname = qds[0][0]
             for an in qds:
@@ -299,6 +306,7 @@ def parse_response(data,qtype):
             for an in ans:
                 if an[2] == qtype:
                     response.answers.append((an[1], an[2], an[3]))
+            response.status = 'resolve'
             return response
     except Exception:
         return None
@@ -346,7 +354,7 @@ def parse_record(data, offset, question=False):
 class DNSResponse():
     def __init__(self):
         self.hostname = None
-        self.status = 'resolve'
+        self.status = None
         self.questions = []  # each: (addr, type, class)
         self.answers = []  # each: (addr, type, class)
 
@@ -418,6 +426,7 @@ async def test2(hostname,qtype,loop):
 
 if __name__ == '__main__':
     loop = asyncio.get_event_loop()
+    # loop = asyncio.ProactorEventLoop()
     dns_resolver = DnsResolver(loop, ('8.8.8.8', 53), ttl =2)
     loop.create_task(test0('www.google.com',TYPES.A, loop))
     loop.create_task(test1('www.google.com',TYPES.A, loop))
