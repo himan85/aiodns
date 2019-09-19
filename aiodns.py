@@ -113,7 +113,7 @@ def build_request(address, qtype):
     return request_id + header + addr + qtype_qclass
 
 
-class DnsResolver():
+class DnsResolver:
     
     def __init__(self, loop, name_server, ttl = 86400, lru_max = 200):
         self._QTYPES = [QTYPE_A, QTYPE_AAAA]
@@ -126,34 +126,30 @@ class DnsResolver():
 
     async def resolve(self, hostname,qtype):
         if type(hostname) != bytes:
-            hostname = hostname.encode('utf8')
+            hostname = hostname.encode()
         response = DNSResponse()
         response.hostname = hostname
         if not hostname:
             raise Exception('empty hostname!')
         if is_ip(hostname):
-            # print('hostname is ip: {}'.format(hostname))
-            response.answers.append((hostname.decode('utf8'),0,0))
+            response.answers.append((hostname.decode(),0,0))
             response.status = 'is_ip'
             return response
         if hostname in self._hosts:
-            # print('hit hosts: {}'.format(hostname))
             ip = self._hosts[hostname]
-            response.answers.append((ip.decode('utf8'),0,0))
+            response.answers.append((ip.decode(),0,0))
             response.status = 'hit_hosts'
             return response
         now = round(time.time())
         cache_result = self._cache.get(hostname)
         if cache_result: 
             if now - cache_result[1] < self._ttl:
-                # print('hit cache: {}'.format(cache_result))
                 response.answers = cache_result[0]
                 response.status = 'hit_cache'
                 return response
             else:
                 return await self._send_req(response, hostname, qtype)
         else:
-            # print('not in cache: {}'.format(hostname))
             return await self._send_req(response, hostname, qtype)
     
     async def _send_req(self, response, hostname, qtype):
@@ -165,7 +161,7 @@ class DnsResolver():
         sock.connect(self._name_server)
         await self._loop.sock_sendall(sock, req)
         try:
-            rsp = await asyncio.wait_for(self._loop.sock_recv(sock,512), 5)
+            rsp = await asyncio.wait_for(self._loop.sock_recv(sock,65535), 5)
         except asyncio.TimeoutError:
             self._close_sock(self._loop, sock)
             raise Exception('wait for dns response timeout!')
@@ -211,7 +207,7 @@ class DnsResolver():
 
 def is_ip(ipaddr):
     if type(ipaddr) != str:
-        ipaddr = ipaddr.decode('utf8')
+        ipaddr = ipaddr.decode()
     try:
         ipaddress.ip_address(ipaddr)
         return True
@@ -351,7 +347,7 @@ def parse_record(data, offset, question=False):
         return nlen + 4, (name, None, record_type, record_class, None, None)
 
 
-class DNSResponse():
+class DNSResponse:
     def __init__(self):
         self.hostname = None
         self.status = None
@@ -362,7 +358,7 @@ class DNSResponse():
         return '%s: %s' % (self.hostname, str(self.answers))
 
 
-class LruCache():
+class LruCache:
 
     def __init__(self, capacity):
         self._capacity = capacity
