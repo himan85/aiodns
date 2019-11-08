@@ -115,60 +115,95 @@ def build_request(address, qtype):
 
 class DnsResolver:
     
-    def __init__(self, loop, name_server, ttl = 86400, lru_max = 200):
-        self._QTYPES = [QTYPE_A, QTYPE_AAAA]
+    def __init__(self, loop, nameservers, port, ttl = 86400, lru_max = 200):
+        self._QTYPES = [QTYPE_A, QTYPE_CNAME]
         self._hosts = {}
         self._parse_hosts()
-        self._name_server = name_server
+        self._nameservers = nameservers
+        self._port = port
         self._loop = loop
         self._ttl = ttl
+        self._socks = {}
         self._cache = LruCache(lru_max)
 
-    async def resolve(self, hostname,qtype):
+    async def resolve(self, hostname, qtype):
+        hostname_id = os.urandom(8)
+        status = 0
+
+        if not qtype in self._QTYPES:
+            raise NotImplementedError("qtype not implemented!")
         if type(hostname) != bytes:
             hostname = hostname.encode()
+
         response = DNSResponse()
+        dns_tasks = []
+
+        for ns in self._nameservers:
+            dns_tasks.append(asyncio.ensure_future(self._resolve(ns, response, hostname, hostname_id, qtype)))
+        done, pending = await asyncio.wait(dns_tasks, timeout=1, return_when=asyncio.FIRST_COMPLETED)
+
+        if pending:
+            status =1
+
+        for task in pending:
+            # cancel all pending task before closing socks.
+            task.cancel() 
+        
+        if status:
+            for sock in list(self._socks):
+                if self._socks[sock] == (hostname, hostname_id):
+                    self._socks.pop(sock)
+                    # remove fd before closing socks when using selector_events.py.
+                    try:
+                        self._loop.remove_reader(sock.fileno())
+                    except:
+                        pass
+                    sock.close()
+
+        for task in dns_tasks:
+            if task in done:
+                return task.result()
+
+        if response.answers == []:
+            raise Exception('dns lookup failed.')
+        
+
+    async def _resolve(self, ns, response, hostname, hostname_id, qtype):
         response.hostname = hostname
         if not hostname:
-            raise Exception('empty hostname!')
+            raise Exception('empty hostname.')
         if is_ip(hostname):
-            response.answers.append((hostname.decode(),0,0))
+            response.answers.append((hostname.decode(),0,0,ns))
             response.status = 'is_ip'
             return response
         if hostname in self._hosts:
             ip = self._hosts[hostname]
-            response.answers.append((ip.decode(),0,0))
+            response.answers.append((ip.decode(),0,0,ns))
             response.status = 'hit_hosts'
             return response
         now = round(time.time())
         cache_result = self._cache.get(hostname)
-        if cache_result: 
-            if now - cache_result[1] < self._ttl:
-                response.answers = cache_result[0]
-                response.status = 'hit_cache'
-                return response
-            else:
-                return await self._send_req(response, hostname, qtype)
-        else:
-            return await self._send_req(response, hostname, qtype)
+        if not cache_result or now - cache_result[1] > self._ttl: 
+            return await self._send_req(ns, response, hostname, hostname_id, qtype)
+        response.answers = cache_result[0]
+        response.status = 'hit_cache'
+        return response
     
-    async def _send_req(self, response, hostname, qtype):
+    async def _send_req(self, ns, response, hostname, hostname_id, qtype):
         if not is_valid_hostname(hostname):
-            raise Exception('invalid hostname:{}'.format(hostname))
-        req = build_request(hostname, self._QTYPES[0])
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            raise Exception('invalid hostname:{}.'.format(hostname))
+        req = build_request(hostname, qtype)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.SOL_UDP)
         sock.setblocking(False)
-        sock.connect(self._name_server)
+        sock.connect((ns,self._port))
+        self._socks.update({sock:(hostname,hostname_id)})
         await self._loop.sock_sendall(sock, req)
-        try:
-            rsp = await asyncio.wait_for(self._loop.sock_recv(sock,65535), 5)
-        except asyncio.TimeoutError:
-            self._close_sock(self._loop, sock)
-            raise Exception('wait for dns response timeout!')
+        rsp = await self._loop.sock_recv(sock,65535)
+        now = round(time.time())
+        response = parse_response(response, ns, rsp, qtype)
+        self._cache.put(hostname,(response.answers,now))
+        self._socks.pop(sock)
         sock.close()
-        re_time = round(time.time())
-        response = parse_response(response, rsp, qtype)
-        self._cache.put(hostname,(response.answers,re_time))
         return response
 
     def _parse_hosts(self):
@@ -195,14 +230,6 @@ class DnsResolver:
                             self._hosts[hostname] = ip
         except IOError:
             self._hosts['localhost'] = '127.0.0.1'
-
-    def _close_sock(self, loop, sock):
-        try:
-            loop.remove_reader(sock.fileno())
-        except NotImplementedError:
-            pass
-        finally:
-            sock.close()
 
 
 def is_ip(ipaddr):
@@ -267,14 +294,13 @@ def parse_header(data):
     return None
 
 
-def parse_response(response, data, qtype):
+def parse_response(response, ns, data, qtype):
     try:
         if len(data) >= 12:
             header = parse_header(data)
             if not header:
                 return None
-            res_id, res_qr, res_tc, res_ra, res_rcode,\
-                res_qdcount, res_ancount, res_nscount, res_arcount = header
+            _, _, _, _, _, res_qdcount, res_ancount, res_nscount, res_arcount = header
 
             qds = []
             ans = []
@@ -298,14 +324,14 @@ def parse_response(response, data, qtype):
             if qds:
                 response.hostname = qds[0][0]
             for an in qds:
-                response.questions.append((an[1], an[2], an[3]))
+                response.questions.append((an[1], an[2], an[3], ns))
             for an in ans:
                 if an[2] == qtype:
-                    response.answers.append((an[1], an[2], an[3]))
+                    response.answers.append((an[1], an[2], an[3], ns))
             response.status = 'resolve'
             return response
-    except Exception:
-        return None
+    except:
+        return response
 
 
 # rfc1035
@@ -388,54 +414,62 @@ def elapsed(stime):
     return int(round(el * 1000))
 
 
-async def test0(hostname,qtype,loop):
-    try:
-        stime = time.time()
-        response = await dns_resolver.resolve(hostname,qtype)
-        # print(response)
-        print('{}: {}, {}, time elapsed: {}ms'.format(hostname, response.answers, response.status, elapsed(stime)))
-    except Exception as e:
-        print(e)
-
-
-async def test1(hostname,qtype,loop):
-    try:
+async def count_socks(socks):
+    while 1:
         await asyncio.sleep(1)
-        stime = time.time()
-        response = await dns_resolver.resolve(hostname,qtype)
-        # print(response)
-        print('{}: {}, {}, time elapsed: {}ms'.format(hostname, response.answers, response.status, elapsed(stime)))
-    except Exception as e:
-        print(e)
+        print(len(socks))
 
 
-async def test2(hostname,qtype,loop):
+async def test(n, hostname, qtype, loop):
     try:
-        await asyncio.sleep(3)
+    # while 1:
+        await asyncio.sleep(n)
         stime = time.time()
         response = await dns_resolver.resolve(hostname,qtype)
-        # print(response)
-        print('{}: {}, {}, time elapsed: {}ms'.format(hostname, response.answers, response.status, elapsed(stime)))
+        print('{}, {}: {}, {}, time elapsed: {}ms.'.format(hostname, qtype, response.answers, response.status, elapsed(stime)))
     except Exception as e:
-        print(e)
-    
+        print(hostname[:20], e)
+
 
 if __name__ == '__main__':
-    loop = asyncio.get_event_loop()
-    # loop = asyncio.ProactorEventLoop()
-    dns_resolver = DnsResolver(loop, ('8.8.8.8', 53), ttl =2)
-    loop.create_task(test0('www.google.com',TYPES.A, loop))
-    loop.create_task(test1('www.google.com',TYPES.A, loop))
-    loop.create_task(test2('www.google.com',TYPES.A, loop))
-    loop.create_task(test0('www.amazon.co.jp',TYPES.A, loop))
-    loop.create_task(test0('192.168.1.1',TYPES.A, loop))
-    loop.create_task(test0(b'www.google.com',TYPES.A, loop))
-    loop.create_task(test0('www.baidu.com',TYPES.A, loop))
-    loop.create_task(test0('www.baidu.com',TYPES.CNAME, loop))
-    loop.create_task(test0('ipv6.google.com',TYPES.AAAA, loop))
-    loop.create_task(test0('ns2.google.com',TYPES.A, loop))
-    loop.create_task(test0('example.com',TYPES.A, loop))
-    loop.create_task(test0('tooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooolong.hostname',TYPES.A, loop))
-    loop.create_task(test0('invalid.@!#$%^&$@.hostname',TYPES.A, loop))
+    nameservers = [
+        '8.8.8.8', 
+        '1.1.1.1',
+        '114.114.114.114'
+    ]
+    # loop = asyncio.get_event_loop()
+    loop = asyncio.ProactorEventLoop()
+    dns_resolver = DnsResolver(loop, nameservers, 53, ttl =3)
+
+
+    ip = ['192.168.1.1']
+    type_a = [
+        'www.google.com',
+        'www.amazon.co.jp',
+        b'www.google.com',
+        'www.baidu.com',
+        'ns2.google.com',
+        'example.com'
+    ]
+    type_aaaa = ['ipv6.google.com']
+    type_cname = ['www.baidu.com']
+    invalid = [
+        'tooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooolong.hostname',
+        'invalid.@!#$%^&$@.hostname'
+    ]
+    
+    for each in type_a:
+        loop.create_task(test(0, each, TYPES.A, loop))
+    for each in type_a:
+        loop.create_task(test(2, each, TYPES.A, loop))  
+    for each in type_a:
+        loop.create_task(test(5, each, TYPES.A, loop))   
+    for each in ip + invalid:
+        loop.create_task(test(0, each, TYPES.A, loop))   
+    for each in type_aaaa:
+        loop.create_task(test(0, each, TYPES.AAAA, loop))
+    for each in type_cname:
+        loop.create_task(test(0, each, TYPES.CNAME, loop))  
+
     loop.run_forever()
 	
