@@ -116,42 +116,63 @@ def build_request(address, qtype):
 class DnsResolver:
     
     def __init__(self, loop, nameservers, port, ttl = 86400, lru_max = 200):
-        self._QTYPES = [QTYPE_A, QTYPE_CNAME]
+        self._qtypes = [QTYPE_A, QTYPE_CNAME]
         self._hosts = {}
+        self._socks = {}
         self._parse_hosts()
         self._nameservers = nameservers
         self._port = port
         self._loop = loop
         self._ttl = ttl
-        self._socks = {}
         self._cache = LruCache(lru_max)
 
     async def resolve(self, hostname, qtype):
-        hostname_id = os.urandom(8)
-        status = 0
-
-        if not qtype in self._QTYPES:
+        if not qtype in self._qtypes:
             raise NotImplementedError("qtype not implemented!")
+        if not hostname:
+            raise Exception('empty hostname.')
         if type(hostname) != bytes:
             hostname = hostname.encode()
+        if not is_valid_hostname(hostname):
+            raise Exception('invalid hostname:{}.'.format(hostname))
 
         response = DNSResponse()
-        dns_tasks = []
+        if is_ip(hostname):
+            response.answers.append((hostname.decode(),0,0,None))
+            response.status = 'is_ip'
+            return response
+
+        if hostname in self._hosts:
+            ip = self._hosts[hostname]
+            response.answers.append((ip.decode(),0,0,None))
+            response.status = 'hit_hosts'
+            return response
+
+        cache_result = self._cache.get(hostname)
+        if not cache_result or round(time.time()) - cache_result[1] > self._ttl: 
+            return await self._resolve(response, hostname, qtype)
+        response.answers = cache_result[0]
+        response.status = 'hit_cache'
+        return response
+
+    async def _resolve(self, response, hostname, qtype):
+        hostname_id = os.urandom(16)
+        resolve_tasks = []
+        results = []
+        done = None
+        pending = None
 
         for ns in self._nameservers:
-            dns_tasks.append(asyncio.ensure_future(self._resolve(ns, response, hostname, hostname_id, qtype)))
-        done, pending = await asyncio.wait(dns_tasks, timeout=1, return_when=asyncio.FIRST_COMPLETED)
+            resolve_tasks.append(asyncio.ensure_future(self._send_req(ns, response, hostname, hostname_id, qtype)))
+        done, pending = await asyncio.wait(resolve_tasks, timeout=1, return_when=asyncio.FIRST_COMPLETED)
 
         if pending:
-            status =1
+            for p in pending:
+                # cancel all pending task before closing socks.
+                p.cancel() 
 
-        for task in pending:
-            # cancel all pending task before closing socks.
-            task.cancel() 
-        
-        if status:
             for sock in list(self._socks):
-                if self._socks[sock] == (hostname, hostname_id):
+                if self._socks[sock] == hostname_id:
                     self._socks.pop(sock)
                     # remove fd before closing socks when using selector_events.py.
                     try:
@@ -160,48 +181,24 @@ class DnsResolver:
                         pass
                     sock.close()
 
-        for task in dns_tasks:
-            if task in done:
-                return task.result()
-
-        if response.answers == []:
+        if not done:
             raise Exception('dns lookup failed.')
-        
 
-    async def _resolve(self, ns, response, hostname, hostname_id, qtype):
-        response.hostname = hostname
-        if not hostname:
-            raise Exception('empty hostname.')
-        if is_ip(hostname):
-            response.answers.append((hostname.decode(),0,0,ns))
-            response.status = 'is_ip'
-            return response
-        if hostname in self._hosts:
-            ip = self._hosts[hostname]
-            response.answers.append((ip.decode(),0,0,ns))
-            response.status = 'hit_hosts'
-            return response
-        now = round(time.time())
-        cache_result = self._cache.get(hostname)
-        if not cache_result or now - cache_result[1] > self._ttl: 
-            return await self._send_req(ns, response, hostname, hostname_id, qtype)
-        response.answers = cache_result[0]
-        response.status = 'hit_cache'
-        return response
+        for d in done:
+            results.append(d.result())
+
+        self._cache.put(hostname, (results[0].answers, round(time.time())))
+        return results[0]            
     
     async def _send_req(self, ns, response, hostname, hostname_id, qtype):
-        if not is_valid_hostname(hostname):
-            raise Exception('invalid hostname:{}.'.format(hostname))
         req = build_request(hostname, qtype)
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.SOL_UDP)
         sock.setblocking(False)
         sock.connect((ns,self._port))
-        self._socks.update({sock:(hostname,hostname_id)})
+        self._socks.update({sock:hostname_id})
         await self._loop.sock_sendall(sock, req)
-        rsp = await self._loop.sock_recv(sock,65535)
-        now = round(time.time())
+        rsp = await self._loop.sock_recv(sock,65507)
         response = parse_response(response, ns, rsp, qtype)
-        self._cache.put(hostname,(response.answers,now))
         self._socks.pop(sock)
         sock.close()
         return response
@@ -434,7 +431,6 @@ async def test(n, hostname, qtype, loop):
 if __name__ == '__main__':
     nameservers = [
         '8.8.8.8', 
-        '1.1.1.1',
         '114.114.114.114'
     ]
     # loop = asyncio.get_event_loop()
