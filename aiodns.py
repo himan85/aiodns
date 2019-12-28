@@ -120,11 +120,13 @@ class DnsResolver:
         self._hosts = {}
         self._socks = {}
         self._parse_hosts()
-        self._nameservers = nameservers
         self._port = port
         self._loop = loop
         self._ttl = ttl
         self._cache = LruCache(lru_max)
+        self._nameservers = nameservers
+        if len(nameservers) != 2:
+            raise Exception('DnsResolver must have a main nameserver and a backup nameserver.')
 
     async def resolve(self, hostname, qtype):
         if not qtype in self._qtypes:
@@ -150,21 +152,23 @@ class DnsResolver:
 
         cache_result = self._cache.get(hostname)
         if not cache_result or round(time.time()) - cache_result[1] > self._ttl: 
-            return await self._resolve(response, hostname, qtype)
+            response =  await self._resolve(response, hostname, qtype)
+            if not response.answers:
+                raise Exception('dns lookup failed:{}.'.format(hostname))
+            self._cache.put(hostname, (response.answers, round(time.time())))
+            return response
         response.answers = cache_result[0]
         response.status = 'hit_cache'
         return response
 
     async def _resolve(self, response, hostname, qtype):
         hostname_id = os.urandom(16)
-        resolve_tasks = []
-        results = []
         done = None
         pending = None
 
-        for ns in self._nameservers:
-            resolve_tasks.append(asyncio.ensure_future(self._send_req(ns, response, hostname, hostname_id, qtype)))
-        done, pending = await asyncio.wait(resolve_tasks, timeout=1, return_when=asyncio.FIRST_COMPLETED)
+        task_0 = asyncio.ensure_future(self._send_req(self._nameservers[0], response, hostname, hostname_id, qtype))
+        task_1 = asyncio.ensure_future(self._send_req(self._nameservers[1], response, hostname, hostname_id, qtype))
+        done, pending = await asyncio.wait([task_0, task_1], return_when=asyncio.FIRST_COMPLETED)
 
         if pending:
             for p in pending:
@@ -181,14 +185,14 @@ class DnsResolver:
                         pass
                     sock.close()
 
-        if not done:
-            raise Exception('dns lookup failed.')
+        if done:
+            results = []
+            for d in done:
+                d.cancel()
+                results.append(d.result())
+            response = results[0] 
 
-        for d in done:
-            results.append(d.result())
-
-        self._cache.put(hostname, (results[0].answers, round(time.time())))
-        return results[0]            
+        return response
     
     async def _send_req(self, ns, response, hostname, hostname_id, qtype):
         req = build_request(hostname, qtype)
@@ -200,6 +204,10 @@ class DnsResolver:
         rsp = await self._loop.sock_recv(sock,65507)
         response = parse_response(response, ns, rsp, qtype)
         self._socks.pop(sock)
+        try:
+            self._loop.remove_reader(sock.fileno())
+        except:
+            pass
         sock.close()
         return response
 
@@ -419,7 +427,6 @@ async def count_socks(socks):
 
 async def test(n, hostname, qtype, loop):
     try:
-    # while 1:
         await asyncio.sleep(n)
         stime = time.time()
         response = await dns_resolver.resolve(hostname,qtype)
